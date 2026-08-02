@@ -51,6 +51,7 @@ from sglang.benchmark.serving import (
     flush_server_cache,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=40, suite="base-a-test-cpu")
 register_cpu_ci(est_time=7, suite="base-c-test-cpu")
@@ -103,7 +104,10 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
         )
         self.assertEqual(_BACKEND_API_PATHS["vllm-embedding"], "/v1/embeddings")
 
-    def test_embedding_cache_flush_uses_the_engine_specific_endpoint(self):
+
+class TestBenchmarkCacheFlush(CustomTestCase):
+    def test_cache_flush_uses_the_backend_specific_request(self):
+        """SGLang flushes wait for idle without changing other backend requests."""
         with (
             patch("sglang.benchmark.serving.get_auth_headers", return_value={}),
             patch("sglang.benchmark.serving.requests.post") as post,
@@ -116,9 +120,29 @@ class TestEmbeddingBenchmarkBackends(unittest.TestCase):
             )
             post.reset_mock()
 
-            flush_server_cache("http://127.0.0.1:30000", "sglang-embedding")
+            flush_server_cache("http://127.0.0.1:30000", "sglang")
             post.assert_called_once_with(
-                "http://127.0.0.1:30000/flush_cache", headers={}
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 60.0},
+            )
+            post.reset_mock()
+
+            flush_server_cache("http://127.0.0.1:23333", "lmdeploy")
+            post.assert_called_once_with(
+                "http://127.0.0.1:23333/flush_cache", headers={}
+            )
+            post.reset_mock()
+
+            flush_server_cache(
+                "http://127.0.0.1:30000",
+                "sglang-embedding",
+                flush_cache_timeout=7.5,
+            )
+            post.assert_called_once_with(
+                "http://127.0.0.1:30000/flush_cache",
+                headers={},
+                params={"timeout": 7.5},
             )
 
 
@@ -1322,6 +1346,25 @@ class TestBenchmarkDatasetsAPI(unittest.TestCase):
         )
         self.assertNotEqual(bad_choice_res.returncode, 0)
         self.assertIn("invalid choice", (bad_choice_res.stderr + bad_choice_res.stdout))
+
+    def test_serving_benchmark_cli_rejects_invalid_flush_cache_timeout(self):
+        """Invalid timeouts fail before the benchmark contacts a server or hangs."""
+        for value in ("inf", "1e999", "0", "-1"):
+            with self.subTest(value=value):
+                res = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "sglang.benchmark.serving",
+                        "--flush-cache-timeout",
+                        value,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                )
+                self.assertEqual(res.returncode, 2, res.stderr)
+                self.assertIn("expected a finite float > 0", res.stderr)
 
     def test_bench_serving_cli_rejects_zipf_without_alpha_before_server(self):
         # Malformed CLI combinations (zipf with no alpha) must fail at
